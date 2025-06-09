@@ -135,6 +135,7 @@ MAKE_FUNCTIONS = {
     'tactical': 'Tactical',
     'target': 'Target',
     'go': 'Go',
+    'minichess': 'MiniChess',
     'rware': 'Rware',
     'trash_pickup': 'TrashPickupEnv',
     'tower_climb': 'TowerClimb',
