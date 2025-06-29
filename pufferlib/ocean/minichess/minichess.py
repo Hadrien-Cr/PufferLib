@@ -10,7 +10,7 @@ class MiniChess(pufferlib.PufferEnv):
              buf=None, seed=0):
 
         self.single_observation_space = gymnasium.spaces.Box(low=0, high=1,
-            shape=(5*5*6*2 + 6,), dtype=np.float32)
+            shape=(5*5 + 6,), dtype=np.float32)
         self.single_action_space = gymnasium.spaces.Discrete(1225)
         self.report_interval = report_interval
         self.render_mode = render_mode
@@ -69,7 +69,7 @@ if __name__ == '__main__':
         atn = actions[tick % atn_cache]         
         env.step(atn)
         tick += 1
-        env.render()
+        # env.render()
 
     print(f'SPS: {num_envs * tick / (time.time() - start)}')
 
