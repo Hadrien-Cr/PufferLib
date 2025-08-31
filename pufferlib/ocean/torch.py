@@ -861,3 +861,54 @@ class GPUDrive(nn.Module):
         action = torch.split(action, self.atn_dim, dim=1)
         value = self.value_fn(flat_hidden)
         return action, value
+
+
+
+class VizBreakout(nn.Module):
+    def __init__(self, env, cnn_channels=16, hidden_size = 128, **kwargs):
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        super().__init__()
+        self.height = env.height
+        self.width = env.width
+        self.cnn = nn.Sequential(
+                pufferlib.pytorch.layer_init(
+                    nn.Conv2d(1, cnn_channels, 5, stride = 2, padding = 2)),
+                nn.ReLU(),
+                pufferlib.pytorch.layer_init(
+                    nn.Conv2d(cnn_channels, cnn_channels, 5, stride=2, padding = 2)),
+                nn.ReLU(),
+                pufferlib.pytorch.layer_init(
+                    nn.Conv2d(cnn_channels, cnn_channels, 5, stride=2, padding = 2)),
+                nn.Flatten()
+        )
+        cnn_flat_size = cnn_channels * 1 * 1 *  \
+            (((((((self.height // 4) - 1 ) //2 + 1) - 1 ) //2 + 1) - 1 ) //2 + 1) * \
+            (((((((self.width  // 4) - 1 ) //2 + 1) - 1 ) //2 + 1) - 1 ) //2 + 1)
+
+        self.proj = pufferlib.pytorch.layer_init(
+                nn.Linear(cnn_flat_size, hidden_size))
+        self.actor = pufferlib.pytorch.layer_init(
+                nn.Linear(hidden_size, env.single_action_space.n), std = 0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+                nn.Linear(hidden_size, 1 ), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_train(self, x, state=None):
+        return self.forward(x, state)
+
+    def encode_observations(self, observations, state=None):
+        img = observations.view(-1, 1, self.height // 4, self.width // 4).float()
+        cnn_features = self.cnn(img)
+        features = self.proj(cnn_features)
+        return features
+    
+    def decode_actions(self, flat_hidden):
+        action = self.actor(flat_hidden)
+        value = self.value_fn(flat_hidden)
+        
+        return action, value

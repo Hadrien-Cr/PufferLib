@@ -1,0 +1,636 @@
+#include <stdlib.h>
+#include <math.h>
+#include <assert.h>
+#include <unistd.h>
+#include <limits.h>
+#include <string.h>
+#include "raylib.h"
+
+#define NOOP 0
+#define LEFT 1
+#define RIGHT 2
+#define MAX_BALL_SPEED 448
+#define HALF_PADDLE_WIDTH 31
+#define Y_OFFSET 50
+#define TICK_RATE 1.0f/60.0f
+
+#define BRICK_INDEX_NO_COLLISION -4
+#define BRICK_INDEX_SIDEWALL_COLLISION -3
+#define BRICK_INDEX_BACKWALL_COLLISION -2
+#define BRICK_INDEX_PADDLE_COLLISION -1
+#define PIXEL_DOWNSAMPLING 4
+
+Color BRICK_COLORS[6] = {RED, ORANGE, YELLOW, GREEN, SKYBLUE, BLUE};
+
+typedef struct Log {
+    float perf;
+    float score;
+    float episode_return;
+    float episode_length;
+    float n;
+} Log;
+
+typedef struct Client {
+    float width;
+    float height;
+    float paddle_width;
+    float paddle_height;
+    float ball_width;
+    float ball_height;    
+    Texture2D ball;
+} Client;
+
+typedef struct VizBreakout {
+    Client* client;
+    Log log;
+    float* observations;
+    float* actions;
+    float* rewards;
+    unsigned char* terminals;
+    int score;
+    float paddle_x;
+    float paddle_y;
+    float ball_x;
+    float ball_y;
+    float ball_vx;
+    float ball_vy;
+    float* brick_x;
+    float* brick_y;
+    float* brick_states;
+    int balls_fired;
+    float paddle_width;
+    float paddle_height;
+    float ball_speed;
+    int hits;
+    int width;
+    int height;
+    int num_bricks;
+    int brick_rows;
+    int brick_cols;
+    int ball_width;
+    int ball_height;
+    int brick_width;
+    int brick_height;
+    int num_balls;
+    int max_score;
+    int half_max_score;
+    int tick;
+    int frameskip;
+    unsigned char hit_brick;
+    int continuous;
+} VizBreakout;
+
+typedef struct CollisionInfo CollisionInfo;
+struct CollisionInfo {
+    float t;
+    float overlap;
+    float x;
+    float y;
+    float vx; 
+    float vy;
+    int brick_index;
+};
+
+void generate_brick_positions(VizBreakout* env) {
+    env->half_max_score=0;
+    for (int row = 0; row < env->brick_rows; row++) {
+        for (int col = 0; col < env->brick_cols; col++) {
+            int idx = row * env->brick_cols + col;
+            env->brick_x[idx] = col*env->brick_width;
+            env->brick_y[idx] = row*env->brick_height + Y_OFFSET;
+            env->half_max_score += 7 - 3 * (idx / env->brick_cols / 2);
+        }
+    }
+    env->max_score=2*env->half_max_score;
+}
+
+void init(VizBreakout* env) {
+    env->tick = 0;
+    env->num_bricks = env->brick_rows * env->brick_cols;
+    assert(env->num_bricks > 0);
+
+    env->brick_x = (float*)calloc(env->num_bricks, sizeof(float));
+    env->brick_y = (float*)calloc(env->num_bricks, sizeof(float));
+    env->brick_states = (float*)calloc(env->num_bricks, sizeof(float));
+    env->num_balls = -1;
+    generate_brick_positions(env);
+}
+
+void allocate(VizBreakout* env) {
+    init(env);
+    env->observations = (float*)calloc((env->width / PIXEL_DOWNSAMPLING) * (env->height / PIXEL_DOWNSAMPLING), sizeof(float));
+    env->actions = (float*)calloc(1, sizeof(float));
+    env->rewards = (float*)calloc(1, sizeof(float));
+    env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+}
+
+void c_close(VizBreakout* env) {
+    free(env->brick_x);
+    free(env->brick_y);
+    free(env->brick_states);
+}
+
+void free_allocated(VizBreakout* env) {
+    free(env->actions);
+    free(env->observations);
+    free(env->terminals);
+    free(env->rewards);
+    c_close(env);
+}
+
+void add_log(VizBreakout* env) {
+    env->log.episode_length += env->tick;
+    env->log.episode_return += env->score;
+    env->log.score += env->score;
+    env->log.perf += env->score / (float)env->max_score;
+    env->log.n += 1;
+}
+
+#define min(a, b)               \
+    ({                          \
+        __typeof__(a) _a = (a); \
+        __typeof__(b) _b = (b); \
+        _a < _b ? _a : _b;      \
+    })
+
+#define max(a, b)               \
+    ({                          \
+        __typeof__(a) _a = (a); \
+        __typeof__(b) _b = (b); \
+        _a > _b ? _a : _b;      \
+    })
+
+float color_to_gray_scale(Color color) {
+    return (0.299f * color.r + 0.587f * color.g + 0.114f * color.b) / 255.0f;
+}
+
+void draw_rect_in_obs(VizBreakout* env, int min_x, int min_y, int width, int height, float fill_value) {
+    for (int x = max(0, min_x / PIXEL_DOWNSAMPLING); x < min((min_x + width) / PIXEL_DOWNSAMPLING, env->width / PIXEL_DOWNSAMPLING); x++) {
+        for (int y = max(0, min_y / PIXEL_DOWNSAMPLING); y <  min((min_y + height)/ PIXEL_DOWNSAMPLING, env->height / PIXEL_DOWNSAMPLING); y++) {
+            env->observations[y * (env->width / PIXEL_DOWNSAMPLING) + x] = fill_value;
+        }
+    }
+}
+
+void compute_observations(VizBreakout* env) {
+    memset(env->observations, 0, (env->width / PIXEL_DOWNSAMPLING) * (env->height / PIXEL_DOWNSAMPLING) * sizeof(float));
+
+    // Draw paddle
+    draw_rect_in_obs(env, env->paddle_x, env->paddle_y,
+        env->paddle_width, env->paddle_height, color_to_gray_scale((Color){0, 255, 255, 255}));
+
+    // Draw ball
+    draw_rect_in_obs(
+        env,
+        env->ball_x,
+        env->ball_y,
+        env->ball_width,
+        env->ball_height,
+        color_to_gray_scale(WHITE)
+    );
+
+    for (int row = 0; row < env->brick_rows; row++) {
+        for (int col = 0; col < env->brick_cols; col++) {
+            int brick_idx = row * env->brick_cols + col;
+            if (env->brick_states[brick_idx] == 1) {
+                continue;
+            }
+            int x = env->brick_x[brick_idx];
+            int y = env->brick_y[brick_idx];
+            Color brick_color = BRICK_COLORS[row];
+            draw_rect_in_obs(env, x, y, env->brick_width, env->brick_height, color_to_gray_scale(brick_color));
+        }
+    }
+    
+}
+
+
+// Collision of a stationary vertical line segment (xw,yw) to (xw,yw+hw)
+// with a moving line segment (x+vx*t,y+vy*t) to (x+vx*t,y+vy*t+h).
+static inline bool calc_vline_collision(float xw, float yw, float hw, float x,
+        float y, float vx, float vy, float h, CollisionInfo* col) {
+    float t_new = (xw - x) / vx;
+    float topmost = fmin(yw + hw, y + h + vy * t_new);
+    float botmost = fmax(yw, y + vy * t_new);
+    float overlap_new = topmost - botmost;
+
+    // Collision finds the smallest time of collision with the greatest overlap
+    // between the ball and the wall.
+    if (overlap_new > 0.0f && t_new > 0.0f && t_new <= 1.0f  && 
+        (t_new < col->t || (t_new == col->t && overlap_new > col->overlap))) {
+        col->t = t_new;
+        col->overlap = overlap_new;
+        col->x = xw;
+        col->y = y + vy * t_new;
+        col->vx = -vx;
+        col->vy = vy;
+        return true;
+    }
+    return false;
+}
+static inline bool calc_hline_collision(float xw, float yw, float ww,
+        float x, float y, float vx, float vy, float w, CollisionInfo* col) {
+    float t_new = (yw - y) / vy;
+    float rightmost = fminf(xw + ww, x + w + vx * t_new);
+    float leftmost = fmaxf(xw, x + vx * t_new);
+    float overlap_new = rightmost - leftmost;
+
+    // Collision finds the smallest time of collision with the greatest overlap between the ball and the wall.
+    if (overlap_new > 0.0f && t_new > 0.0f && t_new <= 1.0f && 
+        (t_new < col->t || (t_new == col->t && overlap_new > col->overlap))) {
+        col->t = t_new;
+        col->overlap = overlap_new;
+        col->x = x + vx * t_new;
+        col->y = yw;
+        col->vx = vx;
+        col->vy = -vy;
+        return true;
+    }
+    return false;
+}
+static inline void calc_brick_collision(VizBreakout* env, int idx, 
+        CollisionInfo* collision_info) {
+    bool collision = false;
+    // Brick left wall collides with ball right side
+    if (env->ball_vx > 0) {
+        if (calc_vline_collision(env->brick_x[idx], env->brick_y[idx], env->brick_height,
+                env->ball_x + env->ball_width, env->ball_y, env->ball_vx, env->ball_vy, env->ball_height, collision_info)) {
+            collision = true;
+            collision_info->x -= env->ball_width;
+        }
+    }
+
+    // Brick right wall collides with ball left side
+    if (env->ball_vx < 0) {
+        if (calc_vline_collision(env->brick_x[idx] + env->brick_width, env->brick_y[idx], env->brick_height,
+                env->ball_x, env->ball_y, env->ball_vx, env->ball_vy, env->ball_height, collision_info)) {
+            collision = true;
+        }
+    }
+
+    // Brick top wall collides with ball bottom side
+    if (env->ball_vy > 0) {
+        if (calc_hline_collision(env->brick_x[idx], env->brick_y[idx], env->brick_width,
+                env->ball_x, env->ball_y + env->ball_height, env->ball_vx, env->ball_vy, env->ball_width, collision_info)) {
+            collision = true;
+            collision_info->y -= env->ball_height;
+        }
+    }
+
+    // Brick bottom wall collides with ball top side
+    if (env->ball_vy < 0) {
+        if (calc_hline_collision(env->brick_x[idx], env->brick_y[idx] + env->brick_height, env->brick_width,
+                env->ball_x, env->ball_y, env->ball_vx, env->ball_vy, env->ball_width, collision_info)) {
+            collision = true;
+        }
+    }
+    if (collision) {
+        collision_info->brick_index = idx;
+    }
+}
+static inline int column_index(VizBreakout* env, float x) {
+    return (int)(floorf(x / env->brick_width));
+}
+static inline int row_index(VizBreakout* env, float y) {
+    return (int)(floorf((y - Y_OFFSET) / env->brick_height));
+}
+
+void calc_all_brick_collisions(VizBreakout* env, CollisionInfo* collision_info) {
+    int column_from = column_index(env, fminf(env->ball_x + env->ball_vx, env->ball_x));
+    column_from = fmaxf(column_from, 0);
+    int column_to = column_index(env, fmaxf(env->ball_x + env->ball_width + env->ball_vx, env->ball_x + env->ball_width));
+    column_to = fminf(column_to, env->brick_cols - 1);
+    int row_from = row_index(env, fminf(env->ball_y + env->ball_vy, env->ball_y));
+    row_from = fmaxf(row_from, 0);
+    int row_to = row_index(env, fmaxf(env->ball_y + env->ball_height + env->ball_vy, env->ball_y + env->ball_height));
+    row_to = fminf(row_to, env->brick_rows - 1);
+
+    for (int row = row_from; row <= row_to; row++) {
+        for (int column = column_from; column <= column_to; column++) {
+            int brick_index = row * env->brick_cols + column;
+            if (env->brick_states[brick_index] == 0.0)
+                calc_brick_collision(env, brick_index, collision_info);
+        }
+    }
+}
+
+bool calc_paddle_ball_collisions(VizBreakout* env, CollisionInfo* collision_info) {
+    float base_angle = M_PI / 4.0f;
+
+    // Check if ball is above the paddle
+    if (env->ball_y + env->ball_height + env->ball_vy < env->paddle_y) {
+        return false;
+    }
+
+    // Check for collision
+    // If we've found another collision (eg the ball hits the wall before the paddle)
+    // this correctly skips the paddle collision.
+    if (!calc_hline_collision(env->paddle_x, env->paddle_y, env->paddle_width,
+          env->ball_x, env->ball_y + env->ball_height, env->ball_vx, env->ball_vy, env->ball_width,
+          collision_info) || collision_info->t > 1.0f) {
+        return false;
+    }
+
+    collision_info->y -= env->ball_height;
+    collision_info->brick_index = BRICK_INDEX_PADDLE_COLLISION;
+
+    env->hit_brick = false;
+    float relative_intersection = ((env->ball_x +
+                                    env->ball_width / 2) -
+                                   env->paddle_x) /
+                                  env->paddle_width;
+    float angle = -base_angle + relative_intersection * 2 * base_angle;
+    env->ball_vx = sin(angle) * env->ball_speed * TICK_RATE;
+    env->ball_vy = -cos(angle) * env->ball_speed * TICK_RATE;
+    env->hits += 1;
+    if (env->hits % 4 == 0 && env->ball_speed < MAX_BALL_SPEED) {
+        env->ball_speed += 64;
+    }
+    if (env->score == env->half_max_score) {
+        for (int i = 0; i < env->num_bricks; i++) {
+            env->brick_states[i] = 0.0;
+        }
+    }
+    return true;
+}
+
+void calc_all_wall_collisions(VizBreakout* env, CollisionInfo* collision_info) {
+    if (env->ball_vx < 0) {
+        if (calc_vline_collision(0, 0, env->height,
+                env->ball_x, env->ball_y, env->ball_vx, env->ball_vy, env->ball_height,
+                collision_info)) {
+            collision_info->brick_index = BRICK_INDEX_SIDEWALL_COLLISION;
+        }
+    }
+    if (env->ball_vx > 0) {
+        if (calc_vline_collision(env->width, 0, env->height,
+                 env->ball_x + env->ball_width, env->ball_y, env->ball_vx, env->ball_vy, env->ball_height,
+                 collision_info)) {
+            collision_info->x -= env->ball_width;
+            collision_info->brick_index = BRICK_INDEX_SIDEWALL_COLLISION;
+        }
+    }
+    if (env->ball_vy < 0) {
+        if (calc_hline_collision(0, 0, env->width,
+                 env->ball_x, env->ball_y, env->ball_vx, env->ball_vy, env->ball_width,
+                 collision_info)) {
+            collision_info->brick_index = BRICK_INDEX_BACKWALL_COLLISION;
+        }
+    }
+}
+
+// With rare floating point conditions, the ball could escape the bounds.
+// Let's handle that explicitly.
+void check_wall_bounds(VizBreakout* env) {
+    if (env->ball_x < 0)
+        env->ball_x += MAX_BALL_SPEED * 1.1f * TICK_RATE;
+    if (env->ball_x > env->width)
+        env->ball_x -= MAX_BALL_SPEED * 1.1f * TICK_RATE;
+    if (env->ball_y < 0)
+        env->ball_y += MAX_BALL_SPEED * 1.1f * TICK_RATE;
+}
+
+void destroy_brick(VizBreakout* env, int brick_idx) {
+    float gained_points = 7 - 3 * ((brick_idx / env->brick_cols) / 2);
+
+    env->score += gained_points;
+    env->brick_states[brick_idx] = 1.0;
+
+    env->rewards[0] += gained_points;
+
+    if (brick_idx / env->brick_cols < 3) {
+        env->ball_speed = MAX_BALL_SPEED;
+    }
+}
+
+bool handle_collisions(VizBreakout* env) {
+    CollisionInfo collision_info = {
+        .t = 2.0f,
+        .overlap = -1.0f,
+        .x = 0.0f,
+        .y = 0.0f,
+        .vx = 0.0f,
+        .vy = 0.0f,
+        .brick_index = BRICK_INDEX_NO_COLLISION,
+    };
+
+    check_wall_bounds(env);
+
+    calc_all_brick_collisions(env, &collision_info);
+    calc_all_wall_collisions(env, &collision_info);
+    calc_paddle_ball_collisions(env, &collision_info);
+    if (collision_info.brick_index != BRICK_INDEX_PADDLE_COLLISION 
+            && collision_info.t <= 1.0f) {
+        env->ball_x = collision_info.x;
+        env->ball_y = collision_info.y;
+        env->ball_vx = collision_info.vx;
+        env->ball_vy = collision_info.vy;
+        if (collision_info.brick_index >= 0) {
+            destroy_brick(env, collision_info.brick_index);
+        }
+        if (collision_info.brick_index == BRICK_INDEX_BACKWALL_COLLISION) {
+            env->paddle_width = HALF_PADDLE_WIDTH;
+        }
+    }
+    return collision_info.brick_index != BRICK_INDEX_NO_COLLISION;
+}
+
+void reset_round(VizBreakout* env) {
+    env->balls_fired = 0;
+    env->hit_brick = false;
+    env->hits = 0;
+    env->ball_speed = 256;
+    env->paddle_width = 2 * HALF_PADDLE_WIDTH;
+
+    env->paddle_x = env->width / 2.0 - env->paddle_width / 2;
+    env->paddle_y = env->height - env->paddle_height - 10;
+
+    env->ball_x = env->paddle_x + (env->paddle_width / 2 - env->ball_width / 2);
+    env->ball_y = env->height / 2 - 30;
+
+    env->ball_vx = 0.0;
+    env->ball_vy = 0.0;
+}
+
+void c_reset(VizBreakout* env) {
+    env->score = 0;
+    env->num_balls = 5;
+    for (int i = 0; i < env->num_bricks; i++) {
+        env->brick_states[i] = 0.0;
+    }
+    reset_round(env);
+    env->tick = 0;
+    compute_observations(env);
+}
+
+void step_frame(VizBreakout* env, float action) {
+    float act = 0.0;
+    if (env->balls_fired == 0) {
+        env->balls_fired = 1;
+        float direction = M_PI / 3.25f;
+
+        env->ball_vy = cos(direction) * env->ball_speed * TICK_RATE;
+        env->ball_vx = sin(direction) * env->ball_speed * TICK_RATE;
+        if (rand() % 2 == 0) {
+            env->ball_vx = -env->ball_vx;
+        }
+    }   
+     else if (action == LEFT) {
+        act = -1.0;
+    } else if (action == RIGHT) {
+        act = 1.0;
+    }
+    if (env->continuous){
+        act = action;
+    }
+    env->paddle_x += act * 620 * TICK_RATE;
+    if (env->paddle_x <= 0){
+        env->paddle_x = fmaxf(0, env->paddle_x);
+    } else {
+        env->paddle_x = fminf(env->width - env->paddle_width, env->paddle_x);
+    }
+
+    //Handle collisions. 
+    //Regular timestepping is done only if there are no collisions.
+    if(!handle_collisions(env)){
+        env->ball_x += env->ball_vx;
+        env->ball_y += env->ball_vy;
+    }
+
+    if (env->ball_y >= env->paddle_y + env->paddle_height) {
+        env->num_balls -= 1;
+        reset_round(env);
+    }
+    if (env->num_balls < 0 || env->score == env->max_score) {
+        env->terminals[0] = 1;
+        add_log(env);
+        c_reset(env);
+    }
+}
+
+void c_step(VizBreakout* env) {
+    env->terminals[0] = 0;
+    env->rewards[0] = 0.0;
+
+    float action = env->actions[0];
+    for (int i = 0; i < env->frameskip; i++) {
+        env->tick += 1;
+        step_frame(env, action);
+    }
+
+    compute_observations(env);
+}
+
+
+
+static inline bool file_exists(const char* path) {
+    return access(path, F_OK) != -1;
+}
+
+Client* make_client(VizBreakout* env) {
+    Client* client = (Client*)calloc(1, sizeof(Client));
+    client->width = env->width;
+    client->height = env->height;
+    client->paddle_width = env->paddle_width;
+    client->paddle_height = env->paddle_height;
+    client->ball_width = env->ball_width;
+    client->ball_height = env->ball_height;
+
+    InitWindow(env->width, env->height, "PufferLib VizBreakout");
+    SetTargetFPS(60);
+
+    char texturePath[PATH_MAX] = {0};
+    char resolvedPath[PATH_MAX] = {0};
+
+    const char* candidatePaths[] = {
+        "./resources/puffers_128.png",
+        "./pufferlib/resources/puffers_128.png",
+        "./pufferlib/pufferlib/resources/puffers_128.png"
+    };
+
+    int found = 0;
+    for (size_t i = 0; i < sizeof(candidatePaths)/sizeof(candidatePaths[0]); i++) {
+        if (file_exists(candidatePaths[i])) {
+            if (realpath(candidatePaths[i], resolvedPath) != NULL) {
+                strncpy(texturePath, resolvedPath, PATH_MAX - 1);
+                found = 1;
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        TraceLog(LOG_ERROR, "Failed to find puffers_128.png from current directory.");
+        CloseWindow();
+        free(client);
+        exit(EXIT_FAILURE);
+    }
+
+    client->ball = LoadTexture(texturePath);
+    TraceLog(LOG_INFO, "Resource path resolution: %s", texturePath);
+
+    return client;
+}
+
+void close_client(Client* client) {
+    CloseWindow();
+    free(client);
+}
+
+void c_render(VizBreakout* env) {
+    if (env->client == NULL) {
+        env->client = make_client(env);
+    }
+
+    Client* client = env->client;
+
+    if (IsKeyDown(KEY_ESCAPE)) {
+        exit(0);
+    }
+    if (IsKeyPressed(KEY_TAB)) {
+        ToggleFullscreen();
+    }
+
+    BeginDrawing();
+    ClearBackground((Color){6, 24, 24, 255});
+
+    DrawRectangle(env->paddle_x, env->paddle_y,
+        env->paddle_width, env->paddle_height, (Color){0, 255, 255, 255});
+
+    // Draw ball
+    DrawTexturePro(
+        client->ball,
+        (Rectangle){
+            (env->ball_vx > 0) ? 0 : 128,
+            0, 128, 128,
+        },
+        (Rectangle){
+            env->ball_x,
+            env->ball_y,
+            env->ball_width,
+            env->ball_height
+        },
+        (Vector2){0, 0},
+        0,
+        WHITE
+    );
+
+    for (int row = 0; row < env->brick_rows; row++) {
+        for (int col = 0; col < env->brick_cols; col++) {
+            int brick_idx = row * env->brick_cols + col;
+            if (env->brick_states[brick_idx] == 1) {
+                continue;
+            }
+            int x = env->brick_x[brick_idx];
+            int y = env->brick_y[brick_idx];
+            Color brick_color = BRICK_COLORS[row];
+            DrawRectangle(x, y, env->brick_width, env->brick_height, brick_color);
+        }
+    }
+
+    DrawText(TextFormat("Score: %i", env->score), 10, 10, 20, WHITE);
+    DrawText(TextFormat("Balls: %i", env->num_balls), client->width - 80, 10, 20, WHITE);
+    EndDrawing();
+
+    //PlaySound(client->sound);
+}
